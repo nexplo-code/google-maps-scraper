@@ -233,20 +233,24 @@ func hasCompletePlaceData(raw []byte) bool {
 	return entry.ReviewCount > 0 || entry.ReviewRating == 0
 }
 
-func (j *PlaceJob) getRaw(ctx context.Context, page scrapemate.BrowserPage) (any, error) {
-	// The last snapshot seen, complete or not. If the page never finishes hydrating we return
-	// this rather than nothing: a partial entry is what the scraper produced before this check
-	// existed, and it beats dropping the place entirely.
+// getRaw polls the page until its place data is complete, or the context runs out.
+//
+// The boolean reports completeness separately from the error so the caller can reload the page
+// and try again before settling for a partial snapshot. Returning partial data as success here
+// would quietly bypass the reload extractJSON already performs.
+func (j *PlaceJob) getRaw(ctx context.Context, page scrapemate.BrowserPage) (any, bool, error) {
+	// The last snapshot seen, complete or not, so a page that never hydrates can still yield
+	// what the scraper produced before this check existed rather than nothing at all.
 	var lastRaw any
 
 	for {
 		select {
 		case <-ctx.Done():
 			if lastRaw != nil {
-				return lastRaw, nil
+				return lastRaw, false, nil
 			}
 
-			return nil, fmt.Errorf("timeout while getting raw data: %w", ctx.Err())
+			return nil, false, fmt.Errorf("timeout while getting raw data: %w", ctx.Err())
 		default:
 			raw, err := page.Eval(js)
 			if err != nil {
@@ -277,7 +281,7 @@ func (j *PlaceJob) getRaw(ctx context.Context, page scrapemate.BrowserPage) (any
 				}
 			}
 
-			return raw, nil
+			return raw, true, nil
 		}
 	}
 }
@@ -287,9 +291,18 @@ func (j *PlaceJob) extractJSON(page scrapemate.BrowserPage) ([]byte, error) {
 
 	for attempt := range maxRetries {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		rawI, err := j.getRaw(ctx, page)
+		rawI, complete, err := j.getRaw(ctx, page)
 
 		cancel()
+
+		// A snapshot that never finished hydrating is worth one reload before we settle for it:
+		// the place data usually lands on a second, warmer load. Only the last attempt keeps the
+		// partial result, so a stubborn page still produces a row.
+		if err == nil && !complete && attempt < maxRetries-1 {
+			if reloadErr := page.Reload(scrapemate.WaitUntilDOMContentLoaded); reloadErr == nil {
+				continue
+			}
+		}
 
 		if err != nil {
 			// On timeout, try reloading the page
