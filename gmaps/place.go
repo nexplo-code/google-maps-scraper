@@ -211,10 +211,41 @@ func (j *PlaceJob) BrowserActions(ctx context.Context, page scrapemate.BrowserPa
 	return resp
 }
 
+// hasCompletePlaceData reports whether a snapshot of APP_INITIALIZATION_STATE is finished
+// hydrating, using the one contradiction the page cannot produce on purpose.
+//
+// Google Maps fills that state progressively, and the header fields land well before the detail
+// ones. A snapshot read too early yields a title, a category, an address, a phone and a rating,
+// but a review count of zero — and a rating is only ever shown for a place that has reviews, so
+// the pair is impossible. Treating it as a real zero is what made 39% of scraped rows come back
+// without their count, their opening hours, or a single review: the count feeds the
+// `reviewCount > 0` guard in BrowserActions, so one early read silently cancels review fetching
+// for the whole place.
+//
+// A genuine zero — no rating either — is accepted immediately, so places nobody has reviewed do
+// not stall here.
+func hasCompletePlaceData(raw []byte) bool {
+	entry, err := EntryFromJSON(raw, true)
+	if err != nil {
+		return false
+	}
+
+	return entry.ReviewCount > 0 || entry.ReviewRating == 0
+}
+
 func (j *PlaceJob) getRaw(ctx context.Context, page scrapemate.BrowserPage) (any, error) {
+	// The last snapshot seen, complete or not. If the page never finishes hydrating we return
+	// this rather than nothing: a partial entry is what the scraper produced before this check
+	// existed, and it beats dropping the place entirely.
+	var lastRaw any
+
 	for {
 		select {
 		case <-ctx.Done():
+			if lastRaw != nil {
+				return lastRaw, nil
+			}
+
 			return nil, fmt.Errorf("timeout while getting raw data: %w", ctx.Err())
 		default:
 			raw, err := page.Eval(js)
@@ -234,6 +265,13 @@ func (j *PlaceJob) getRaw(ctx context.Context, page scrapemate.BrowserPage) (any
 			// If it's a string, make sure it's not empty
 			if str, ok := raw.(string); ok {
 				if str == "" {
+					<-time.After(time.Millisecond * 200)
+					continue
+				}
+
+				lastRaw = raw
+
+				if !hasCompletePlaceData(trimJSONPrefix(str)) {
 					<-time.After(time.Millisecond * 200)
 					continue
 				}
@@ -279,14 +317,17 @@ func (j *PlaceJob) extractJSON(page scrapemate.BrowserPage) ([]byte, error) {
 			return nil, fmt.Errorf("could not convert to string, got type %T", rawI)
 		}
 
-		const prefix = `)]}'`
-
-		raw = strings.TrimSpace(strings.TrimPrefix(raw, prefix))
-
-		return []byte(raw), nil
+		return trimJSONPrefix(raw), nil
 	}
 
 	return nil, fmt.Errorf("APP_INITIALIZATION_STATE data not found after retries")
+}
+
+// trimJSONPrefix strips the anti-hijacking prefix Google puts in front of the state blob.
+func trimJSONPrefix(raw string) []byte {
+	const prefix = `)]}'`
+
+	return []byte(strings.TrimSpace(strings.TrimPrefix(raw, prefix)))
 }
 
 func (j *PlaceJob) getReviewCount(data []byte) int {
