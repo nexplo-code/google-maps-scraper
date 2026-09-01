@@ -389,6 +389,11 @@ func EntryFromJSON(raw []byte, reviewCountOnly ...bool) (entry Entry, err error)
 	entry.ReviewCount = int(getNthElementAndCast[float64](darray, 4, 8))
 
 	if onlyReviewCount {
+		// The rating lives next door, at index 7, and it is what tells a place with no reviews
+		// apart from a page that has not finished hydrating. Callers probing for completeness
+		// need both numbers, and reading one more index costs nothing.
+		entry.ReviewRating = getNthElementAndCast[float64](darray, 4, 7)
+
 		return entry, nil
 	}
 

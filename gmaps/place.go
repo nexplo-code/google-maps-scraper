@@ -211,11 +211,46 @@ func (j *PlaceJob) BrowserActions(ctx context.Context, page scrapemate.BrowserPa
 	return resp
 }
 
-func (j *PlaceJob) getRaw(ctx context.Context, page scrapemate.BrowserPage) (any, error) {
+// hasCompletePlaceData reports whether a snapshot of APP_INITIALIZATION_STATE is finished
+// hydrating, using the one contradiction the page cannot produce on purpose.
+//
+// Google Maps fills that state progressively, and the header fields land well before the detail
+// ones. A snapshot read too early yields a title, a category, an address, a phone and a rating,
+// but a review count of zero — and a rating is only ever shown for a place that has reviews, so
+// the pair is impossible. Treating it as a real zero is what made 39% of scraped rows come back
+// without their count, their opening hours, or a single review: the count feeds the
+// `reviewCount > 0` guard in BrowserActions, so one early read silently cancels review fetching
+// for the whole place.
+//
+// A genuine zero — no rating either — is accepted immediately, so places nobody has reviewed do
+// not stall here.
+func hasCompletePlaceData(raw []byte) bool {
+	entry, err := EntryFromJSON(raw, true)
+	if err != nil {
+		return false
+	}
+
+	return entry.ReviewCount > 0 || entry.ReviewRating == 0
+}
+
+// getRaw polls the page until its place data is complete, or the context runs out.
+//
+// The boolean reports completeness separately from the error so the caller can reload the page
+// and try again before settling for a partial snapshot. Returning partial data as success here
+// would quietly bypass the reload extractJSON already performs.
+func (j *PlaceJob) getRaw(ctx context.Context, page scrapemate.BrowserPage) (any, bool, error) {
+	// The last snapshot seen, complete or not, so a page that never hydrates can still yield
+	// what the scraper produced before this check existed rather than nothing at all.
+	var lastRaw any
+
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("timeout while getting raw data: %w", ctx.Err())
+			if lastRaw != nil {
+				return lastRaw, false, nil
+			}
+
+			return nil, false, fmt.Errorf("timeout while getting raw data: %w", ctx.Err())
 		default:
 			raw, err := page.Eval(js)
 			if err != nil {
@@ -237,9 +272,16 @@ func (j *PlaceJob) getRaw(ctx context.Context, page scrapemate.BrowserPage) (any
 					<-time.After(time.Millisecond * 200)
 					continue
 				}
+
+				lastRaw = raw
+
+				if !hasCompletePlaceData(trimJSONPrefix(str)) {
+					<-time.After(time.Millisecond * 200)
+					continue
+				}
 			}
 
-			return raw, nil
+			return raw, true, nil
 		}
 	}
 }
@@ -249,9 +291,18 @@ func (j *PlaceJob) extractJSON(page scrapemate.BrowserPage) ([]byte, error) {
 
 	for attempt := range maxRetries {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		rawI, err := j.getRaw(ctx, page)
+		rawI, complete, err := j.getRaw(ctx, page)
 
 		cancel()
+
+		// A snapshot that never finished hydrating is worth one reload before we settle for it:
+		// the place data usually lands on a second, warmer load. Only the last attempt keeps the
+		// partial result, so a stubborn page still produces a row.
+		if err == nil && !complete && attempt < maxRetries-1 {
+			if reloadErr := page.Reload(scrapemate.WaitUntilDOMContentLoaded); reloadErr == nil {
+				continue
+			}
+		}
 
 		if err != nil {
 			// On timeout, try reloading the page
@@ -279,14 +330,17 @@ func (j *PlaceJob) extractJSON(page scrapemate.BrowserPage) ([]byte, error) {
 			return nil, fmt.Errorf("could not convert to string, got type %T", rawI)
 		}
 
-		const prefix = `)]}'`
-
-		raw = strings.TrimSpace(strings.TrimPrefix(raw, prefix))
-
-		return []byte(raw), nil
+		return trimJSONPrefix(raw), nil
 	}
 
 	return nil, fmt.Errorf("APP_INITIALIZATION_STATE data not found after retries")
+}
+
+// trimJSONPrefix strips the anti-hijacking prefix Google puts in front of the state blob.
+func trimJSONPrefix(raw string) []byte {
+	const prefix = `)]}'`
+
+	return []byte(strings.TrimSpace(strings.TrimPrefix(raw, prefix)))
 }
 
 func (j *PlaceJob) getReviewCount(data []byte) int {
