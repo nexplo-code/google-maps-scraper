@@ -42,14 +42,14 @@ func TestHasCompletePlaceData(t *testing.T) {
 			reason: "Google never shows a rating for a place with no reviews, so the pair is impossible",
 		},
 		{
-			name:   "a count present means the detail fields have landed",
-			raw:    state(4.5, 1509),
-			want:   true,
+			name: "a count present means the detail fields have landed",
+			raw:  state(4.5, 1509),
+			want: true,
 		},
 		{
-			name:   "no rating and no count is a genuine unreviewed place, not a stall",
-			raw:    state(0, 0),
-			want:   true,
+			name: "no rating and no count is a genuine unreviewed place, not a stall",
+			raw:  state(0, 0),
+			want: true,
 		},
 		{
 			name: "unparseable input is never treated as complete",
