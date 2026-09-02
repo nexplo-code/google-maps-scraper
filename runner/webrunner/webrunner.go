@@ -24,6 +24,10 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// How long to wait for Start to return after its own context has already expired. Past this the
+// scrape is provably over and only the browser teardown can still be running.
+const teardownGrace = 90 * time.Second
+
 type webrunner struct {
 	srv       *web.Server
 	svc       *web.Service
@@ -239,16 +243,41 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 
 		go exitMonitor.Run(mateCtx)
 
-		err = mate.Start(mateCtx, seedJobs...)
-		if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
-			cancel()
+		// Start is waited on with a deadline of its own, because it can outlive the scrape.
+		//
+		// When the browser stops answering the Playwright protocol, `browserContext.Close()`
+		// blocks on a select with no timeout — inside scrapemateapp's own shutdown defer, where
+		// no context reaches it. A goroutine dump from a stuck container showed exactly that,
+		// with no worker goroutines left: the crawl had finished and only the teardown hung.
+		// It happened 37 times in 38 regions, each costing an operator ten minutes.
+		//
+		// mateCtx already bounds the scraping itself, so once its deadline has passed plus a
+		// grace period, whatever Start is still doing is not scraping. The results are already
+		// in the CSV at that point, so the job is complete and the queue should move on.
+		startDone := make(chan error, 1)
 
-			err2 := w.svc.Update(ctx, job)
-			if err2 != nil {
-				log.Printf("failed to update job status: %v", err2)
+		go func() {
+			startDone <- mate.Start(mateCtx, seedJobs...)
+		}()
+
+		select {
+		case err = <-startDone:
+			if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+				cancel()
+
+				err2 := w.svc.Update(ctx, job)
+				if err2 != nil {
+					log.Printf("failed to update job status: %v", err2)
+				}
+
+				return err
 			}
-
-			return err
+		case <-time.After(time.Duration(allowedSeconds)*time.Second + teardownGrace):
+			// The goroutine and its browser are abandoned rather than reclaimed: there is no
+			// way to interrupt a call blocked inside the Playwright transport. The container
+			// exits on inactivity and is restarted, which collects them.
+			log.Printf("job %s: scrape finished but teardown did not return within %s; continuing",
+				job.ID, teardownGrace)
 		}
 
 		cancel()
