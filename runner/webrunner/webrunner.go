@@ -251,18 +251,24 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 		// with no worker goroutines left: the crawl had finished and only the teardown hung.
 		// It happened 37 times in 38 regions, each costing an operator ten minutes.
 		//
-		// mateCtx already bounds the scraping itself, so once its deadline has passed plus a
-		// grace period, whatever Start is still doing is not scraping. The results are already
-		// in the CSV at that point, so the job is complete and the queue should move on.
+		// mateCtx bounds the scraping itself, so once it is done — by deadline, by the exit
+		// monitor noticing the crawl went quiet, or by the parent being cancelled — whatever
+		// Start is still doing is not scraping. The results are already in the CSV at that
+		// point, so the job is complete and the queue should move on.
+		//
+		// The grace is timed from mateCtx being done rather than from the job's full allowance,
+		// which is what a first version got wrong. A region that finished crawling in 78 seconds
+		// under a 720-second allowance still waited the whole 720 plus the grace before anyone
+		// noticed the hang: twelve minutes of a worker holding a queue slot to wait for nothing.
 		startDone := make(chan error, 1)
 
 		go func() {
 			startDone <- mate.Start(mateCtx, seedJobs...)
 		}()
 
-		select {
-		case err = <-startDone:
-			if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		handleStartErr := func(startErr error) error {
+			if startErr != nil && !errors.Is(startErr, context.DeadlineExceeded) &&
+				!errors.Is(startErr, context.Canceled) {
 				cancel()
 
 				err2 := w.svc.Update(ctx, job)
@@ -270,14 +276,32 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 					log.Printf("failed to update job status: %v", err2)
 				}
 
-				return err
+				return startErr
 			}
-		case <-time.After(time.Duration(allowedSeconds)*time.Second + teardownGrace):
-			// The goroutine and its browser are abandoned rather than reclaimed: there is no
-			// way to interrupt a call blocked inside the Playwright transport. The container
-			// exits on inactivity and is restarted, which collects them.
-			log.Printf("job %s: scrape finished but teardown did not return within %s; continuing",
-				job.ID, teardownGrace)
+
+			return nil
+		}
+
+		select {
+		case err = <-startDone:
+			if handled := handleStartErr(err); handled != nil {
+				return handled
+			}
+		case <-mateCtx.Done():
+			// Scraping is over. Give the shutdown a bounded chance to finish on its own before
+			// walking away from it.
+			select {
+			case err = <-startDone:
+				if handled := handleStartErr(err); handled != nil {
+					return handled
+				}
+			case <-time.After(teardownGrace):
+				// The goroutine and its browser are abandoned rather than reclaimed: there is
+				// no way to interrupt a call blocked inside the Playwright transport. The
+				// container exits on inactivity and is restarted, which collects them.
+				log.Printf("job %s: scrape finished but teardown did not return within %s; continuing",
+					job.ID, teardownGrace)
+			}
 		}
 
 		cancel()
