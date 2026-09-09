@@ -457,6 +457,90 @@ func decodeDOMReviews(raw []any) []DOMReview {
 	return decoded
 }
 
+// How many reviews the DOM pass keeps per place.
+//
+// Ten rather than everything: sorted by rating they are the ten best a place has, which is what a
+// card needs, and each further scroll is time on a page whose teardown is the failure mode that
+// wedged 37 of 38 regions before the grace period was added.
+const maxDOMReviews = 10
+
+// sortReviewsByRating asks the reviews panel for the highest-rated reviews first.
+//
+// Google decides which reviews to embed in the page payload, and its choice is "most relevant" —
+// which promotes the loudest, not the representative. Measured across 5339 places, the eight it
+// embeds average 0.52 stars below the place's own rating, and the gap widens the more there is to
+// complain about: -0.32 for places rated 4.5-4.9, -0.89 at 4.0-4.4, -1.20 at 3.5-3.9. One venue
+// rated 4.2 by 275 people was represented by eight reviews averaging 1.6.
+//
+// Sorting is the only lever left. The RPC that would return sorted pages answers 403 to us, and
+// the Places API returns five reviews with the same skew, three of them duplicates of what we
+// already hold. The panel is already open in a real browser, so this costs one click.
+//
+// Failure is not an error: a page whose sort control has moved keeps the reviews it had.
+func sortReviewsByRating(ctx context.Context, page scrapemate.BrowserPage) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	default:
+	}
+
+	clicked, err := page.Eval(`() => {
+		const wantsSort = (text) => {
+			const lowered = (text || '').toLowerCase();
+			return lowered.includes('sort') || lowered.includes('classificar') ||
+			       lowered.includes('ordenar') || lowered.includes('mais relevante') ||
+			       lowered.includes('most relevant');
+		};
+		const buttons = document.querySelectorAll('button, [role="button"]');
+		for (const button of buttons) {
+			const label = button.getAttribute('aria-label') || button.textContent || '';
+			if (wantsSort(label)) {
+				button.click();
+				return true;
+			}
+		}
+		return false;
+	}`)
+	if err != nil || clicked == nil || clicked == false {
+		return false
+	}
+
+	// The menu is rendered after the click, and there is no load event to wait on.
+	time.Sleep(1500 * time.Millisecond)
+
+	picked, err := page.Eval(`() => {
+		const wantsHighest = (text) => {
+			const lowered = (text || '').toLowerCase();
+			return lowered.includes('highest rating') || lowered.includes('mais bem avaliad') ||
+			       lowered.includes('classificação mais alta') || lowered.includes('nota mais alta');
+		};
+		const items = Array.from(document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"]'));
+		for (const item of items) {
+			if (wantsHighest(item.getAttribute('aria-label') || item.textContent || '')) {
+				item.click();
+				return 'by_label';
+			}
+		}
+		// Google orders the menu the same way in every locale: relevant, newest, highest, lowest.
+		// Falling back to the position keeps this working through a wording change, and picking
+		// nothing is better than picking the wrong one, so it only applies to a menu of four.
+		if (items.length === 4) {
+			items[2].click();
+			return 'by_position';
+		}
+		return false;
+	}`)
+	if err != nil || picked == nil || picked == false {
+		return false
+	}
+
+	log.Printf("reviews sorted by rating (%v)", picked)
+	// The panel refetches; without this the next read returns the previous order.
+	time.Sleep(2500 * time.Millisecond)
+
+	return true
+}
+
 // extractReviewsFromPage extracts reviews directly from the page DOM
 // This is a fallback when the RPC API fails
 func extractReviewsFromPage(ctx context.Context, page scrapemate.BrowserPage) ([]DOMReview, error) {
@@ -474,11 +558,19 @@ func extractReviewsFromPage(ctx context.Context, page scrapemate.BrowserPage) ([
 				}
 			}
 
-			// Method 2: Click on the reviews tab
+			// Method 2: Click on the reviews tab.
+			//
+			// Matched against both vocabularies. Google localizes this label, and the scrape runs
+			// with GO_SCRAPER_LANG=pt, so testing only for "review" meant the panel never opened
+			// on any Brazilian page and the DOM path silently produced nothing.
+			const wantsReviews = (text) => {
+				const lowered = (text || '').toLowerCase();
+				return lowered.includes('review') || lowered.includes('avalia');
+			};
 			const tabs = document.querySelectorAll('button[role="tab"]');
 			for (const tab of tabs) {
 				const label = tab.getAttribute('aria-label') || tab.textContent || '';
-				if (label.toLowerCase().includes('review')) {
+				if (wantsReviews(label)) {
 					tab.click();
 					return 'reviews_tab';
 				}
@@ -495,7 +587,8 @@ func extractReviewsFromPage(ctx context.Context, page scrapemate.BrowserPage) ([
 			const allLinks = document.querySelectorAll('a, button');
 			for (const link of allLinks) {
 				const text = link.textContent?.toLowerCase() || '';
-				if (text.includes('all review') || text.includes('see review') || text.includes('more review')) {
+				if (text.includes('all review') || text.includes('see review') || text.includes('more review') ||
+				    text.includes('todas as avalia') || text.includes('mais avalia')) {
 					link.click();
 					return 'all_reviews_link';
 				}
@@ -514,6 +607,8 @@ func extractReviewsFromPage(ctx context.Context, page scrapemate.BrowserPage) ([
 
 	// Wait for reviews panel to load
 	time.Sleep(3 * time.Second)
+
+	sortReviewsByRating(ctx, page)
 
 	var reviews []DOMReview
 
@@ -749,6 +844,17 @@ func extractReviewsFromPage(ctx context.Context, page scrapemate.BrowserPage) ([
 		}
 
 		currentCount := len(reviews)
+		// Enough. Sorted by rating, the first ten are the ten best the place has, and every extra
+		// scroll is page time spent on a browser whose shutdown is the thing that hangs.
+		if currentCount >= maxDOMReviews {
+			log.Printf("collected %d reviews, stopping scroll", currentCount)
+
+			if len(reviews) > maxDOMReviews {
+				reviews = reviews[:maxDOMReviews]
+			}
+
+			break
+		}
 		if currentCount == lastCount {
 			stuckCount++
 			if stuckCount > 5 {
