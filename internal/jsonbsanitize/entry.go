@@ -52,6 +52,7 @@ func StripNULFromEntry(entry *gmaps.Entry) {
 	cleanAddress(&entry.CompleteAddress)
 	cleanAbout(entry.About)
 	cleanReviews(entry.UserReviews)
+	cleanReviews(entry.UserReviewsRecent)
 	cleanReviews(entry.UserReviewsExtended)
 }
 

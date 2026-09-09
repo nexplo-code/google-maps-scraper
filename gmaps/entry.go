@@ -137,6 +137,9 @@ type Entry struct {
 	CreditCardsAccepted []string     `json:"credit_cards_accepted"`
 	About               []About      `json:"about"`
 	UserReviews         []Review     `json:"user_reviews"`
+	// The reviews panel read sorted by date. Kept apart from the rating-sorted list because the
+	// ordering that surfaced a review is the only thing that says what it is evidence of.
+	UserReviewsRecent   []Review     `json:"user_reviews_recent"`
 	UserReviewsExtended []Review     `json:"user_reviews_extended"`
 	Emails              []string     `json:"emails"`
 }
@@ -276,6 +279,7 @@ func (e *Entry) CsvHeaders() []string {
 		"credit_cards_accepted",
 		"about",
 		"user_reviews",
+		"user_reviews_recent",
 		"user_reviews_extended",
 		"emails",
 	}
@@ -317,6 +321,7 @@ func (e *Entry) CsvRow() []string {
 		stringSliceToString(e.CreditCardsAccepted),
 		stringify(e.About),
 		stringify(e.UserReviews),
+		stringify(e.UserReviewsRecent),
 		stringify(e.UserReviewsExtended),
 		stringSliceToString(e.Emails),
 	}

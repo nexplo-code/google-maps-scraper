@@ -457,14 +457,49 @@ func decodeDOMReviews(raw []any) []DOMReview {
 	return decoded
 }
 
-// How many reviews the DOM pass keeps per place.
+// How deep each DOM pass reads, which is not the same number for the two orderings.
 //
-// Ten rather than everything: sorted by rating they are the ten best a place has, which is what a
-// card needs, and each further scroll is time on a page whose teardown is the failure mode that
-// wedged 37 of 38 regions before the grace period was added.
-const maxDOMReviews = 10
+// Sorted by date, ten is everything worth having: the list is in date order, so once it crosses
+// the one-year line that the ingestion enforces, every review below it is older still. Scrolling
+// further buys nothing but page time on a browser whose teardown is the failure mode that wedged
+// 37 of 38 regions.
+//
+// Sorted by rating there is no such cut-off. The list is ordered by stars, so reviews from the
+// last year sit scattered through it, and reading only the top ten yielded 1.98 usable reviews per
+// place against the date pass's 3.98. Going deeper is the one place where more scrolling can
+// still convert into reviews that survive the age guard.
+const (
+	maxRecentReviews   = 10
+	maxTopRatedReviews = 30
+)
 
-// sortReviewsByRating asks the reviews panel for the highest-rated reviews first.
+// reviewOrder is one entry of the reviews panel's sort menu.
+//
+// Google renders the menu in the same order in every locale — relevant, newest, highest, lowest —
+// so the position is a usable fallback when the wording changes. It only applies to a menu of
+// four, because picking nothing is better than picking the wrong ordering.
+type reviewOrder struct {
+	name     string
+	matchJS  string
+	position int
+}
+
+var (
+	orderNewest = reviewOrder{
+		name: "newest",
+		matchJS: `lowered.includes('newest') || lowered.includes('mais recente') ||
+		          lowered.includes('mais novas')`,
+		position: 1,
+	}
+	orderHighest = reviewOrder{
+		name: "highest",
+		matchJS: `lowered.includes('highest rating') || lowered.includes('mais bem avaliad') ||
+		          lowered.includes('classificação mais alta') || lowered.includes('nota mais alta')`,
+		position: 2,
+	}
+)
+
+// sortReviews asks the reviews panel to reorder itself.
 //
 // Google decides which reviews to embed in the page payload, and its choice is "most relevant" —
 // which promotes the loudest, not the representative. Measured across 5339 places, the eight it
@@ -472,12 +507,17 @@ const maxDOMReviews = 10
 // complain about: -0.32 for places rated 4.5-4.9, -0.89 at 4.0-4.4, -1.20 at 3.5-3.9. One venue
 // rated 4.2 by 275 people was represented by eight reviews averaging 1.6.
 //
+// Relevance is also the ordering that ages worst. Once a review older than a year is discarded
+// downstream, the relevant panel is the half that empties: a Guará sample kept 3.4 rating-sorted
+// reviews per place against 0.6 relevant ones. Asking for the newest instead is what puts recent
+// reviews of every rating back in reach, which is why this takes the ordering as an argument.
+//
 // Sorting is the only lever left. The RPC that would return sorted pages answers 403 to us, and
 // the Places API returns five reviews with the same skew, three of them duplicates of what we
 // already hold. The panel is already open in a real browser, so this costs one click.
 //
 // Failure is not an error: a page whose sort control has moved keeps the reviews it had.
-func sortReviewsByRating(ctx context.Context, page scrapemate.BrowserPage) bool {
+func sortReviews(ctx context.Context, page scrapemate.BrowserPage, order reviewOrder) bool {
 	select {
 	case <-ctx.Done():
 		return false
@@ -489,7 +529,9 @@ func sortReviewsByRating(ctx context.Context, page scrapemate.BrowserPage) bool 
 			const lowered = (text || '').toLowerCase();
 			return lowered.includes('sort') || lowered.includes('classificar') ||
 			       lowered.includes('ordenar') || lowered.includes('mais relevante') ||
-			       lowered.includes('most relevant');
+			       lowered.includes('most relevant') || lowered.includes('mais recente') ||
+			       lowered.includes('newest') || lowered.includes('mais bem avaliad') ||
+			       lowered.includes('highest rating');
 		};
 		const buttons = document.querySelectorAll('button, [role="button"]');
 		for (const button of buttons) {
@@ -508,44 +550,83 @@ func sortReviewsByRating(ctx context.Context, page scrapemate.BrowserPage) bool 
 	// The menu is rendered after the click, and there is no load event to wait on.
 	time.Sleep(1500 * time.Millisecond)
 
-	picked, err := page.Eval(`() => {
-		const wantsHighest = (text) => {
+	picked, err := page.Eval(fmt.Sprintf(`() => {
+		const wanted = (text) => {
 			const lowered = (text || '').toLowerCase();
-			return lowered.includes('highest rating') || lowered.includes('mais bem avaliad') ||
-			       lowered.includes('classificação mais alta') || lowered.includes('nota mais alta');
+			return %s;
 		};
 		const items = Array.from(document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"]'));
 		for (const item of items) {
-			if (wantsHighest(item.getAttribute('aria-label') || item.textContent || '')) {
+			if (wanted(item.getAttribute('aria-label') || item.textContent || '')) {
 				item.click();
 				return 'by_label';
 			}
 		}
-		// Google orders the menu the same way in every locale: relevant, newest, highest, lowest.
-		// Falling back to the position keeps this working through a wording change, and picking
-		// nothing is better than picking the wrong one, so it only applies to a menu of four.
 		if (items.length === 4) {
-			items[2].click();
+			items[%d].click();
 			return 'by_position';
 		}
 		return false;
-	}`)
+	}`, order.matchJS, order.position))
 	if err != nil || picked == nil || picked == false {
 		return false
 	}
 
-	log.Printf("reviews sorted by rating (%v)", picked)
+	log.Printf("reviews sorted by %s (%v)", order.name, picked)
 	// The panel refetches; without this the next read returns the previous order.
 	time.Sleep(2500 * time.Millisecond)
 
 	return true
 }
 
-// extractReviewsFromPage extracts reviews directly from the page DOM
-// This is a fallback when the RPC API fails
-func extractReviewsFromPage(ctx context.Context, page scrapemate.BrowserPage) ([]DOMReview, error) {
+// extractReviewsFromPage reads the reviews panel twice, once per ordering.
+//
+// Two passes rather than one because the two orderings answer different questions and neither
+// alone survives the one-year cut-off: newest guarantees the reviews are current whatever they
+// say, highest guarantees the place is represented by its best, and only together do they fill
+// ten slots that are both recent and balanced. The second pass costs a click and one more read of
+// a panel that is already open — the browser, the navigation and the panel are all paid for by
+// the first.
+//
+// This is a fallback for when the RPC API fails, which for us is always.
+func extractReviewsFromPage(ctx context.Context, page scrapemate.BrowserPage) ([]DOMReview, []DOMReview, error) {
 	log.Printf("Attempting DOM-based review extraction")
 
+	if err := openReviewsPanel(ctx, page); err != nil {
+		return nil, nil, err
+	}
+
+	var recent, topRated []DOMReview
+
+	if sortReviews(ctx, page, orderNewest) {
+		collected, err := collectDOMReviews(ctx, page, maxRecentReviews)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		recent = collected
+	}
+
+	// The rating pass runs whether or not the newest one worked. When the sort control is missing
+	// entirely both passes read the panel in Google's own order, and the duplicate is dropped
+	// downstream rather than here, where nothing knows which orderings actually took effect.
+	sortReviews(ctx, page, orderHighest)
+
+	collected, err := collectDOMReviews(ctx, page, maxTopRatedReviews)
+	if err != nil {
+		return recent, nil, err
+	}
+
+	topRated = collected
+
+	log.Printf("DOM extraction completed: %d recent, %d top rated", len(recent), len(topRated))
+
+	return recent, topRated, nil
+}
+
+// openReviewsPanel gets the reviews list on screen, trying the four places Google has put the
+// entry point over time.
+func openReviewsPanel(_ context.Context, page scrapemate.BrowserPage) error {
 	// First, try to click the reviews section to open the reviews panel
 	clickedReviews, _ := page.Eval(`() => {
 		try {
@@ -608,8 +689,14 @@ func extractReviewsFromPage(ctx context.Context, page scrapemate.BrowserPage) ([
 	// Wait for reviews panel to load
 	time.Sleep(3 * time.Second)
 
-	sortReviewsByRating(ctx, page)
+	return nil
+}
 
+// collectDOMReviews scrolls the open panel until it has limit reviews or stops yielding new ones.
+//
+// It reads whatever ordering the panel is currently in, so the caller decides both what the
+// reviews mean and how deep it is worth going for them.
+func collectDOMReviews(ctx context.Context, page scrapemate.BrowserPage, limit int) ([]DOMReview, error) {
 	var reviews []DOMReview
 
 	maxScrollAttempts := 30
@@ -858,11 +945,11 @@ func extractReviewsFromPage(ctx context.Context, page scrapemate.BrowserPage) ([
 		currentCount := len(reviews)
 		// Enough. Sorted by rating, the first ten are the ten best the place has, and every extra
 		// scroll is page time spent on a browser whose shutdown is the thing that hangs.
-		if currentCount >= maxDOMReviews {
+		if currentCount >= limit {
 			log.Printf("collected %d reviews, stopping scroll", currentCount)
 
-			if len(reviews) > maxDOMReviews {
-				reviews = reviews[:maxDOMReviews]
+			if len(reviews) > limit {
+				reviews = reviews[:limit]
 			}
 
 			break
@@ -910,13 +997,13 @@ func extractReviewsFromPage(ctx context.Context, page scrapemate.BrowserPage) ([
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	log.Printf("DOM extraction completed: %d reviews found", len(reviews))
+	log.Printf("collected %d reviews in this ordering", len(reviews))
 
 	return reviews, nil
 }
 
 // FetchReviewsWithFallback attempts RPC-based extraction first, then falls back to DOM
-func FetchReviewsWithFallback(ctx context.Context, params fetchReviewsParams) (FetchReviewsResponse, []DOMReview, error) {
+func FetchReviewsWithFallback(ctx context.Context, params fetchReviewsParams) (FetchReviewsResponse, []DOMReview, []DOMReview, error) {
 	fetcher := newReviewFetcher(params)
 
 	// Try RPC-based extraction first
@@ -932,7 +1019,7 @@ func FetchReviewsWithFallback(ctx context.Context, params fetchReviewsParams) (F
 
 		if totalReviews > 0 {
 			log.Printf("RPC extraction successful: %d review pages, ~%d reviews", len(rpcResponse.pages), totalReviews)
-			return rpcResponse, nil, nil
+			return rpcResponse, nil, nil, nil
 		}
 
 		log.Printf("RPC returned empty reviews, trying DOM extraction")
@@ -940,10 +1027,10 @@ func FetchReviewsWithFallback(ctx context.Context, params fetchReviewsParams) (F
 
 	// Fallback to DOM-based extraction
 	if params.page != nil {
-		domReviews, domErr := extractReviewsFromPage(ctx, params.page)
-		if domErr == nil && len(domReviews) > 0 {
-			log.Printf("DOM extraction successful: %d reviews", len(domReviews))
-			return FetchReviewsResponse{}, domReviews, nil
+		recent, topRated, domErr := extractReviewsFromPage(ctx, params.page)
+		if domErr == nil && len(recent)+len(topRated) > 0 {
+			log.Printf("DOM extraction successful: %d recent, %d top rated", len(recent), len(topRated))
+			return FetchReviewsResponse{}, recent, topRated, nil
 		}
 
 		if domErr != nil {
@@ -953,8 +1040,8 @@ func FetchReviewsWithFallback(ctx context.Context, params fetchReviewsParams) (F
 
 	// Return whatever we have
 	if err != nil {
-		return FetchReviewsResponse{}, nil, fmt.Errorf("all review extraction methods failed: %v", err)
+		return FetchReviewsResponse{}, nil, nil, fmt.Errorf("all review extraction methods failed: %v", err)
 	}
 
-	return rpcResponse, nil, nil
+	return rpcResponse, nil, nil, nil
 }

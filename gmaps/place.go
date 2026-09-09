@@ -115,14 +115,30 @@ func (j *PlaceJob) Process(_ context.Context, resp *scrapemate.Response) (any, [
 		entry.AddExtraReviews(allReviewsRaw.pages)
 	}
 
-	// Handle DOM-based reviews (fallback)
+	// Handle DOM-based reviews (fallback), one ordering at a time.
+	//
+	// The two lists stay apart all the way to the database: which ordering surfaced a review is
+	// what lets a card show recent and well-rated side by side, and merging them here would throw
+	// that away before anything could use it. Each is deduped against the embedded set, and the
+	// rating pass additionally against the newest one, since a review can be both.
+	recentReviews, ok := resp.Meta["dom_reviews_recent"].([]DOMReview)
+	if ok && len(recentReviews) > 0 {
+		converted := ConvertDOMReviewsToReviews(recentReviews)
+		entry.UserReviewsRecent = append(
+			entry.UserReviewsRecent,
+			dedupeDOMReviewsAgainstPrimary(entry.UserReviews, converted)...,
+		)
+	}
+
 	domReviews, ok := resp.Meta["dom_reviews"].([]DOMReview)
 	if ok && len(domReviews) > 0 {
 		convertedReviews := ConvertDOMReviewsToReviews(domReviews)
 
 		deduped := dedupeDOMReviewsAgainstPrimary(entry.UserReviews, convertedReviews)
+		deduped = dedupeDOMReviewsAgainstPrimary(entry.UserReviewsRecent, deduped)
+
 		if len(deduped) != len(convertedReviews) {
-			log.Printf("DOM reviews: dropped %d of %d already present in user_reviews",
+			log.Printf("DOM reviews: dropped %d of %d already present in earlier orderings",
 				len(convertedReviews)-len(deduped), len(convertedReviews))
 		}
 
@@ -195,15 +211,21 @@ func (j *PlaceJob) BrowserActions(ctx context.Context, page scrapemate.BrowserPa
 			}
 
 			// Use the new fallback mechanism that tries RPC first, then DOM
-			rpcData, domReviews, err := FetchReviewsWithFallback(ctx, params)
+			rpcData, recentReviews, topRatedReviews, err := FetchReviewsWithFallback(ctx, params)
 
 			switch {
 			case err != nil:
 				fmt.Printf("Warning: review extraction failed: %v\n", err)
 			case len(rpcData.pages) > 0:
 				resp.Meta["reviews_raw"] = rpcData
-			case len(domReviews) > 0:
-				resp.Meta["dom_reviews"] = domReviews
+			default:
+				if len(recentReviews) > 0 {
+					resp.Meta["dom_reviews_recent"] = recentReviews
+				}
+
+				if len(topRatedReviews) > 0 {
+					resp.Meta["dom_reviews"] = topRatedReviews
+				}
 			}
 		}
 	}
