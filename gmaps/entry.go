@@ -43,6 +43,14 @@ type Address struct {
 }
 
 type Option struct {
+	// Google's own identifier for the attribute, e.g. /geo/type/establishment_poi/serves_beer.
+	//
+	// It sits at index 0 of the option, beside the label at index 1, and was read past. The label
+	// is the interface string: it translates, and it loses distinctions the identifier keeps —
+	// "Almoço" is both serves_lunch and serves_lunch_popular, "Wi-Fi" is both has_wi_fi and
+	// wi_fi. Across 1513 observations no identifier appeared under two labels, while three labels
+	// appeared under two identifiers, so the identifier is the more precise of the two.
+	ID      string   `json:"id,omitempty"`
 	Name    string   `json:"name"`
 	Enabled bool     `json:"enabled"`
 	Values  []string `json:"values,omitempty"`
@@ -510,6 +518,7 @@ func EntryFromJSON(raw []byte, reviewCountOnly ...bool) (entry Entry, err error)
 
 		for j := range optsI {
 			opt := Option{
+				ID:      getNthElementAndCast[string](optsI, j, 0),
 				Enabled: (getNthElementAndCast[float64](optsI, j, 2, 1, 0, 0)) == 1,
 				Name:    getNthElementAndCast[string](optsI, j, 1),
 				Values:  getOptionValues(getNthElementAndCast[[]any](optsI, j)),
@@ -916,9 +925,21 @@ func stringSliceToString(s []string) string {
 	return strings.Join(s, ", ")
 }
 
+// addOrMergeOption folds a repeated attribute into the one already collected.
+//
+// Matched on the identifier when both carry one, because the label does not identify an
+// attribute: "Almoço" is both serves_lunch and serves_lunch_popular, "Wi-Fi" is both has_wi_fi
+// and wi_fi. Merging those by name collapses two different facts into one and silently drops
+// whichever arrived second. The label remains the fallback for an attribute Google sends without
+// an identifier.
 func addOrMergeOption(options *[]Option, opt Option) {
 	for i := range *options {
-		if (*options)[i].Name != opt.Name {
+		sameOption := (*options)[i].ID != "" && opt.ID != ""
+		if sameOption {
+			if (*options)[i].ID != opt.ID {
+				continue
+			}
+		} else if (*options)[i].Name != opt.Name {
 			continue
 		}
 

@@ -743,9 +743,21 @@ func extractReviewsFromPage(ctx context.Context, page scrapemate.BrowserPage) ([
 							const el = element.querySelector(sel);
 							if (el) {
 								const text = el.textContent?.trim() || '';
-								// Look for time-related text (ago, month, year, etc)
-								if (text && (text.includes('ago') || text.includes('week') || text.includes('month') ||
-								    text.includes('year') || text.includes('day') || text.match(/\d{4}/))) {
+								// Time-related text, in either vocabulary. Google localizes this the way it
+								// localizes the tab label, so testing only for the English words meant a
+								// Brazilian page yielded no date at all: 1131 sorted reviews were stored
+								// with nothing to age them by, which is what the age guard reads.
+								const lowered = text.toLowerCase();
+								const looksLikeTime =
+									lowered.includes('ago') || lowered.includes('week') ||
+									lowered.includes('month') || lowered.includes('year') ||
+									lowered.includes('day') ||
+									lowered.includes('atrás') || lowered.includes('atras') ||
+									lowered.includes('semana') || lowered.includes('mês') ||
+									lowered.includes('mes') || lowered.includes('ano') ||
+									lowered.includes('dia') || lowered.includes('hora') ||
+									/\d{4}/.test(text);
+								if (text && looksLikeTime) {
 									relativeTime = text;
 									break;
 								}
