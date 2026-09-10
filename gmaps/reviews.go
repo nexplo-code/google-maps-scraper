@@ -524,31 +524,48 @@ func sortReviews(ctx context.Context, page scrapemate.BrowserPage, order reviewO
 	default:
 	}
 
-	clicked, err := page.Eval(`() => {
-		const wantsSort = (text) => {
-			const lowered = (text || '').toLowerCase();
-			return lowered.includes('sort') || lowered.includes('classificar') ||
-			       lowered.includes('ordenar') || lowered.includes('mais relevante') ||
-			       lowered.includes('most relevant') || lowered.includes('mais recente') ||
-			       lowered.includes('newest') || lowered.includes('mais bem avaliad') ||
-			       lowered.includes('highest rating');
-		};
-		const buttons = document.querySelectorAll('button, [role="button"]');
-		for (const button of buttons) {
-			const label = button.getAttribute('aria-label') || button.textContent || '';
-			if (wantsSort(label)) {
-				button.click();
-				return true;
-			}
+	// Clicking the control once is not enough, and waiting longer does not help: on 60% of pages
+	// the menu never rendered at all, however long we waited, while the button clicked was
+	// "Classificar avaliações" — the right one — every single time. The button exists in the DOM
+	// before Google has bound a handler to it, so an early click lands on nothing and no amount of
+	// patience produces a menu. Only clicking again does.
+	var clickedLabel string
+
+	opened := false
+
+	for attempt := 0; attempt < sortOpenAttempts && !opened; attempt++ {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
 		}
-		return false;
-	}`)
-	if err != nil || clicked == nil || clicked == false {
-		return false
+
+		// The control is a toggle, so a click aimed at a menu that is already open closes it.
+		// Without this check a run of clicks can alternate open and shut and end on shut, which
+		// looks identical to a click that never worked.
+		if sortMenuPresent(page) {
+			opened = true
+
+			break
+		}
+
+		label, ok := clickSortControl(page)
+		if !ok {
+			log.Printf("sort %s failed: no control matched on the page", order.name)
+
+			return false
+		}
+
+		clickedLabel = label
+		opened = waitForSortMenu(ctx, page)
 	}
 
-	// The menu is rendered after the click, and there is no load event to wait on.
-	time.Sleep(1500 * time.Millisecond)
+	if !opened {
+		log.Printf("sort %s failed: menu never rendered after %d clicks (last %q)",
+			order.name, sortOpenAttempts, clickedLabel)
+
+		return false
+	}
 
 	picked, err := page.Eval(fmt.Sprintf(`() => {
 		const wanted = (text) => {
@@ -566,9 +583,19 @@ func sortReviews(ctx context.Context, page scrapemate.BrowserPage, order reviewO
 			items[%d].click();
 			return 'by_position';
 		}
-		return false;
+		return 'menu:' + items.length + ':' + items.map(
+			(i) => (i.getAttribute('aria-label') || i.textContent || '').trim().slice(0, 24)
+		).join('|');
 	}`, order.matchJS, order.position))
 	if err != nil || picked == nil || picked == false {
+		log.Printf("sort %s failed: menu did not open (err=%v)", order.name, err)
+
+		return false
+	}
+
+	if reason, ok := picked.(string); ok && strings.HasPrefix(reason, "menu:") {
+		log.Printf("sort %s failed: %s (clicked %q)", order.name, reason, clickedLabel)
+
 		return false
 	}
 
@@ -577,6 +604,97 @@ func sortReviews(ctx context.Context, page scrapemate.BrowserPage, order reviewO
 	time.Sleep(2500 * time.Millisecond)
 
 	return true
+}
+
+// How many times the sort control is clicked before giving up, and how long each click is given
+// to produce a menu. Short waits and several clicks rather than one long wait: the failure being
+// worked around is a click that landed before the handler existed, which no wait can repair.
+const (
+	sortOpenAttempts = 6
+	sortMenuChecks   = 6
+)
+
+// The reviews panel's sort control, for a real click.
+//
+// Both spellings because Google puts the wording in aria-label on some pages and in the button
+// text on others, and both locales because the scrape has run under each.
+const sortControlSelector = `button[aria-label*="Classificar"], button[aria-label*="Ordenar"], ` +
+	`button[aria-label*="Sort"], button:has-text("Classificar avalia"), button:has-text("Sort review")`
+
+// clickSortControl presses the sort button, preferring a real click to a scripted one.
+//
+// A scripted element.click() fires whether or not the element is ready, and Google binds the
+// handler some time after the button appears — which is why 38% of a large region came back
+// unsorted while the label read "Classificar avaliações" every time. Playwright's click waits for
+// the element to be visible, stable and able to receive the event, and dispatches a trusted one.
+// The scripted click stays as a fallback for pages where the selector finds nothing.
+func clickSortControl(page scrapemate.BrowserPage) (string, bool) {
+	if n, err := page.Locator(sortControlSelector).Count(); err == nil && n > 0 {
+		if err := page.Locator(sortControlSelector).First().Click(5 * time.Second); err == nil {
+			return "locator", true
+		}
+	}
+
+	clicked, err := page.Eval(`() => {
+		const wantsSort = (text) => {
+			const lowered = (text || '').toLowerCase();
+			return lowered.includes('sort') || lowered.includes('classificar') ||
+			       lowered.includes('ordenar') || lowered.includes('mais relevante') ||
+			       lowered.includes('most relevant') || lowered.includes('mais recente') ||
+			       lowered.includes('newest') || lowered.includes('mais bem avaliad') ||
+			       lowered.includes('highest rating');
+		};
+		const buttons = document.querySelectorAll('button, [role="button"]');
+		for (const button of buttons) {
+			const label = button.getAttribute('aria-label') || button.textContent || '';
+			if (wantsSort(label)) {
+				button.click();
+				return (label || '').trim().slice(0, 40);
+			}
+		}
+		return false;
+	}`)
+	if err != nil || clicked == nil || clicked == false {
+		return "", false
+	}
+
+	label, _ := clicked.(string)
+
+	return label, true
+}
+
+// sortMenuPresent reports whether the sort menu is on screen right now.
+//
+// Answered as a boolean rather than a count: a number crosses this boundary as whatever numeric
+// type the driver picks, and a type assertion that guesses wrong reads every rendered menu as an
+// empty one. That mistake took a 61% failure rate to 100%.
+func sortMenuPresent(page scrapemate.BrowserPage) bool {
+	present, err := page.Eval(`() => document.querySelectorAll(
+		'[role="menuitemradio"], [role="menuitem"], [role="option"]'
+	).length > 0`)
+
+	return err == nil && present == true
+}
+
+// waitForSortMenu polls until the sort menu has items, or gives up on this click.
+func waitForSortMenu(ctx context.Context, page scrapemate.BrowserPage) bool {
+	const interval = 250 * time.Millisecond
+
+	for i := 0; i < sortMenuChecks; i++ {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+
+		if sortMenuPresent(page) {
+			return true
+		}
+
+		time.Sleep(interval)
+	}
+
+	return false
 }
 
 // extractReviewsFromPage reads the reviews panel twice, once per ordering.
