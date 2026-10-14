@@ -451,20 +451,7 @@ func EntryFromJSON(raw []byte, reviewCountOnly ...bool) (entry Entry, err error)
 	entry.DataID = getNthElementAndCast[string](darray, 10)
 	entry.PlaceID = getNthElementAndCast[string](darray, 78)
 
-	items := getLinkSource(getLinkSourceParams{
-		arr:    getNthElementAndCast[[]any](darray, 171, 0),
-		link:   []int{3, 0, 6, 0},
-		source: []int{2},
-	})
-
-	entry.Images = make([]Image, len(items))
-
-	for i := range items {
-		entry.Images[i] = Image{
-			Title: items[i].Source,
-			Image: items[i].Link,
-		}
-	}
+	entry.Images = getImages(darray)
 
 	// Extract Street View URL from images
 	entry.StreetViewURL = extractStreetViewURL(entry.Images)
@@ -763,6 +750,66 @@ func getLinkSource(params getLinkSourceParams) []LinkSource {
 	return result
 }
 
+// getImages reads the place's photo gallery, in whichever layout the page carries.
+//
+// Google moved the gallery out of [171] around Oct 2026: that slot is now null and the photos sit
+// at [51][0], one level shallower, with the attribution string replaced by a numeric kind. The
+// old reader could not survive either change — it asked `getLinkSource` for a `source` string and
+// that function drops any item whose source is empty, so every photo of every place was discarded
+// while the URLs sat right there in the state. The damage was silent: a scrape still returned a
+// title, a rating and opening hours, just no gallery, and the cover photo in [72] kept working, so
+// each place came back with exactly one image instead of five.
+//
+// Both layouts are read, newest first, the way getHours and the status field already do.
+//
+//nolint:gomnd // it's ok, I need the indexes
+func getImages(darray []any) []Image {
+	if images := imagesFromGallery(getNthElementAndCast[[]any](darray, 51, 0)); len(images) > 0 {
+		return images
+	}
+
+	legacy := getLinkSource(getLinkSourceParams{
+		arr:    getNthElementAndCast[[]any](darray, 171, 0),
+		link:   []int{3, 0, 6, 0},
+		source: []int{2},
+	})
+
+	images := make([]Image, len(legacy))
+
+	for i := range legacy {
+		images[i] = Image{
+			Title: legacy[i].Source,
+			Image: legacy[i].Link,
+		}
+	}
+
+	return images
+}
+
+// imagesFromGallery reads the Oct 2026 layout, where each item holds its URL at [6][0].
+//
+// There is no attribution text any more — [2] is a numeric kind, not the "All"/"Latest" label the
+// old layout carried — so Title is left empty rather than filled with an invented value. Nothing
+// downstream reads it except the Street View check, which matches the URL as well.
+//
+//nolint:gomnd // it's ok, I need the indexes
+func imagesFromGallery(items []any) []Image {
+	var images []Image
+
+	for i := range items {
+		item := getNthElementAndCast[[]any](items, i)
+
+		link := getNthElementAndCast[string](item, 6, 0)
+		if link == "" {
+			continue
+		}
+
+		images = append(images, Image{Image: link})
+	}
+
+	return images
+}
+
 //nolint:gomnd // it's ok, I need the indexes
 func getHours(darray []any) map[string][]string {
 	// Try new structure first (as of Nov 2025) - darray[203][0]
@@ -1000,13 +1047,19 @@ func stringify(v any) string {
 }
 
 // extractStreetViewURL finds the Street View image and extracts the panoid to create a proper URL
+// extractStreetViewURL finds the panorama among the gallery images, if there is one.
+//
+// The title was the only clue in the old layout; the newer one carries no title at all, so the
+// panorama is recognised by the `panoid` its URL carries either way.
 func extractStreetViewURL(images []Image) string {
 	for _, img := range images {
-		if strings.Contains(img.Title, "Street View") {
-			matches := panoidRegex.FindStringSubmatch(img.Image)
-			if len(matches) > 1 {
-				return fmt.Sprintf("https://www.google.com/maps/@?api=1&map_action=pano&pano=%s", matches[1])
-			}
+		if !strings.Contains(img.Title, "Street View") && !panoidRegex.MatchString(img.Image) {
+			continue
+		}
+
+		matches := panoidRegex.FindStringSubmatch(img.Image)
+		if len(matches) > 1 {
+			return fmt.Sprintf("https://www.google.com/maps/@?api=1&map_action=pano&pano=%s", matches[1])
 		}
 	}
 
