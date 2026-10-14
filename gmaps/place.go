@@ -109,6 +109,10 @@ func (j *PlaceJob) Process(_ context.Context, resp *scrapemate.Response) (any, [
 		entry.Link = j.GetURL()
 	}
 
+	if albumPhotos, ok := resp.Meta["album_photos"].([]AlbumPhoto); ok && len(albumPhotos) > 0 {
+		entry.AlbumPhotos = albumPhotos
+	}
+
 	// Handle RPC-based reviews
 	allReviewsRaw, ok := resp.Meta["reviews_raw"].(FetchReviewsResponse)
 	if ok && len(allReviewsRaw.pages) > 0 {
@@ -200,6 +204,33 @@ func (j *PlaceJob) BrowserActions(ctx context.Context, page scrapemate.BrowserPa
 	}
 
 	resp.Meta["json"] = raw
+
+	// The album, while the page is open and carrying its cookies.
+	//
+	// It has to happen here rather than in Process: the listing is only served to a request made
+	// from inside the page, and by the time Process runs the page is gone. Measured on three
+	// places — the same request from the stealth HTTP client answers with the photo count and an
+	// empty array, whatever the request is varied to.
+	//
+	// A failure is logged and dropped. A place without its album is a place with the five
+	// photographs the page already gave us, which is what it would have had anyway.
+	if limit := albumPhotoLimit(); limit > 0 {
+		ftid := j.getDataID(raw)
+
+		switch {
+		case ftid == "":
+			fmt.Printf("Warning: album skipped, no data_id in the page state for %s\n", j.GetURL())
+		default:
+			photos, err := FetchAlbum(ctx, page, ftid, j.LangCode(), "", limit)
+
+			switch {
+			case err != nil:
+				fmt.Printf("Warning: album extraction failed for %s: %v\n", ftid, err)
+			case len(photos) > 0:
+				resp.Meta["album_photos"] = photos
+			}
+		}
+	}
 
 	if j.ExtractExtraReviews {
 		reviewCount := j.getReviewCount(raw)
@@ -372,6 +403,24 @@ func (j *PlaceJob) getReviewCount(data []byte) int {
 	}
 
 	return tmpEntry.ReviewCount
+}
+
+// getDataID reads the place's feature id, which is what the photo listing is keyed on.
+//
+// Not EntryFromJSON(data, true): that shortcut returns before the id is read. An empty string
+// means the snapshot was not usable, and the album is simply skipped.
+func (j *PlaceJob) getDataID(data []byte) string {
+	return DataIDFromJSON(data)
+}
+
+// LangCode reports the language this job asks Google for, so a sibling request can ask in the
+// same one. It lives in the URL params because that is where NewPlaceJob puts it.
+func (j *PlaceJob) LangCode() string {
+	if j.URLParams == nil {
+		return ""
+	}
+
+	return j.URLParams["hl"]
 }
 
 func (j *PlaceJob) UseInResults() bool {

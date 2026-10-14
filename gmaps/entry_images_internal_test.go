@@ -32,6 +32,19 @@ func legacyGalleryItem(url, title string) []any {
 	return item
 }
 
+// The header list and the row list are written out by hand, side by side. Adding a column to one
+// and not the other does not fail anything — it shifts every value after it by one, and the CSV
+// stays perfectly well-formed while meaning something else entirely.
+func TestEntryCsvHeadersAndRowStayAligned(t *testing.T) {
+	entry := Entry{
+		Title:       "Qualquer Lugar",
+		Images:      []Image{{Image: "https://lh3.googleusercontent.com/gps-cs-s/a"}},
+		AlbumPhotos: []AlbumPhoto{{ID: "x", URL: "https://lh3.googleusercontent.com/gps-cs-s/b"}},
+	}
+
+	require.Len(t, entry.CsvRow(), len(entry.CsvHeaders()))
+}
+
 func TestGetImagesReadsTheCurrentGallery(t *testing.T) {
 	darray := newDarray()
 	darray[51] = []any{[]any{

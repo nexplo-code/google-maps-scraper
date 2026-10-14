@@ -139,9 +139,21 @@ type Entry struct {
 	UserReviews         []Review     `json:"user_reviews"`
 	// The reviews panel read sorted by date. Kept apart from the rating-sorted list because the
 	// ordering that surfaced a review is the only thing that says what it is evidence of.
-	UserReviewsRecent   []Review     `json:"user_reviews_recent"`
-	UserReviewsExtended []Review     `json:"user_reviews_extended"`
-	Emails              []string     `json:"emails"`
+	UserReviewsRecent   []Review `json:"user_reviews_recent"`
+	UserReviewsExtended []Review `json:"user_reviews_extended"`
+	Emails              []string `json:"emails"`
+	/*
+	   The place's full album, read from the photo listing rather than from the page.
+
+	   Kept apart from Images on purpose. Images is the embedded gallery — four photographs and a
+	   cover — and two things already read that field for what it is: extractStreetViewURL looks
+	   for the panorama in it, and the ingestion downstream spends its own photo budget on it.
+	   Merging the album in would change both of their meanings at once; a column of its own
+	   changes nothing that already works.
+
+	   Empty unless GMAPS_ALBUM_PHOTO_LIMIT asks for it.
+	*/
+	AlbumPhotos []AlbumPhoto `json:"album_photos"`
 }
 
 // entryAlias is used inside Marshal/UnmarshalJSON to avoid infinite recursion
@@ -282,6 +294,9 @@ func (e *Entry) CsvHeaders() []string {
 		"user_reviews_recent",
 		"user_reviews_extended",
 		"emails",
+		// Appended, never inserted: both readers resolve by header name, so a new column at the
+		// end leaves every CSV already on disk readable.
+		"album_photos",
 	}
 }
 
@@ -324,6 +339,7 @@ func (e *Entry) CsvRow() []string {
 		stringify(e.UserReviewsRecent),
 		stringify(e.UserReviewsExtended),
 		stringSliceToString(e.Emails),
+		stringify(e.AlbumPhotos),
 	}
 }
 
@@ -367,6 +383,28 @@ func extractReviews(data []byte) []Review {
 	}
 
 	return parseReviews(reviewsI)
+}
+
+// DataIDFromJSON reads just the place's feature id out of a state snapshot.
+//
+// Exists because the album listing is keyed on it and needs it *while the page is still open*,
+// before the full entry is built. Reading it through EntryFromJSON's review-count shortcut does
+// not work — that path returns before index 10 is touched — and building the whole entry to reach
+// one string is work the browser step does not need to do.
+//
+//nolint:gomnd // it's ok, I need the indexes
+func DataIDFromJSON(raw []byte) string {
+	var jd []any
+	if err := json.Unmarshal(raw, &jd); err != nil {
+		return ""
+	}
+
+	darray := getNthElementAndCast[[]any](jd, 6)
+	if len(darray) == 0 {
+		return ""
+	}
+
+	return getNthElementAndCast[string](darray, 10)
 }
 
 //nolint:gomnd // it's ok, I need the indexes
