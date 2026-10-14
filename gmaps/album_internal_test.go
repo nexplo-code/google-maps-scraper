@@ -81,30 +81,72 @@ func TestParseAlbumResponseRefusesSomethingThatIsNotJson(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestSelectAlbumPhotosPrefersUserPhotographs(t *testing.T) {
+// Kind 10 is a video and the URL hands back a still frame of it, on the same host a photograph
+// comes from. This test used to assert the opposite — that a bigger kind-10 entry was a
+// photograph worth ranking below a kind-12 one — which is how a frame of someone's walkthrough
+// became storable.
+func TestSelectAlbumPhotosDropsVideos(t *testing.T) {
 	photos := []AlbumPhoto{
-		{ID: "a", URL: "https://lh3.googleusercontent.com/gps-cs-s/a", Kind: 10, Width: 4000, Height: 3000},
-		{ID: "b", URL: "https://lh3.googleusercontent.com/gps-cs-s/b", Kind: 12, Width: 800, Height: 600},
-	}
-
-	selected := selectAlbumPhotos(photos, 1)
-
-	// The smaller one wins because it is a user photograph: kind outranks size.
-	require.Len(t, selected, 1)
-	require.Equal(t, "b", selected[0].ID)
-}
-
-// A place whose whole album is panoramas must still come back with them. Filtering kind strictly
-// is how a small place ends up with no photograph at all.
-func TestSelectAlbumPhotosTopsUpFromOtherKindsWhenShort(t *testing.T) {
-	photos := []AlbumPhoto{
-		{ID: "a", URL: "https://lh3.googleusercontent.com/gps-cs-s/a", Kind: 10, Width: 800, Height: 600},
-		{ID: "b", URL: "https://lh3.googleusercontent.com/gps-cs-s/b", Kind: 1, Width: 800, Height: 600},
+		{ID: "video", URL: "https://lh3.googleusercontent.com/gps-cs-s/a", Kind: albumKindVideo, Width: 1920, Height: 1080},
+		{ID: "foto", URL: "https://lh3.googleusercontent.com/gps-cs-s/b", Kind: albumKindUserPhoto, Width: 800, Height: 600},
 	}
 
 	selected := selectAlbumPhotos(photos, 10)
 
-	require.Len(t, selected, 2)
+	require.Len(t, selected, 1)
+	require.Equal(t, "foto", selected[0].ID)
+}
+
+func TestSelectAlbumPhotosDropsPanoramas(t *testing.T) {
+	photos := []AlbumPhoto{
+		{ID: "pano", URL: "https://lh3.googleusercontent.com/gps-cs-s/a", Kind: albumKindPanorama, Width: 7200, Height: 3600},
+		{ID: "foto", URL: "https://lh3.googleusercontent.com/gps-cs-s/b", Kind: albumKindUserPhoto, Width: 800, Height: 600},
+	}
+
+	selected := selectAlbumPhotos(photos, 10)
+
+	require.Len(t, selected, 1)
+	require.Equal(t, "foto", selected[0].ID)
+}
+
+// A thin album is not a problem to be solved with worse material: four good photographs beat four
+// plus six frames of a video, and the old top-up said otherwise.
+func TestSelectAlbumPhotosLeavesAThinAlbumThin(t *testing.T) {
+	photos := []AlbumPhoto{
+		{ID: "a", URL: "https://lh3.googleusercontent.com/gps-cs-s/a", Kind: albumKindVideo, Width: 1920, Height: 1080},
+		{ID: "b", URL: "https://lh3.googleusercontent.com/gps-cs-s/b", Kind: 1, Width: 800, Height: 600},
+		{ID: "c", URL: "https://lh3.googleusercontent.com/gps-cs-s/c", Kind: albumKindPanorama, Width: 7200, Height: 3600},
+	}
+
+	require.Empty(t, selectAlbumPhotos(photos, 10))
+}
+
+// The kind is the first gate, not the only one: a kind we have not met yet must not be able to
+// walk an equirectangular strip or a baked-in camera angle past us.
+func TestSelectAlbumPhotosDropsPanoramaShapeAndAngleWhateverTheKind(t *testing.T) {
+	photos := []AlbumPhoto{
+		{ID: "forma", URL: "https://lh3.googleusercontent.com/gps-cs-s/a", Kind: albumKindUserPhoto, Width: 7200, Height: 3600},
+		{ID: "angulo", URL: "https://lh3.googleusercontent.com/gps-cs-s/b=w224-h298-k-no-pi0.03-ya80.00-ro1.02-fo100", Kind: albumKindUserPhoto, Width: 800, Height: 600},
+		{ID: "foto", URL: "https://lh3.googleusercontent.com/gps-cs-s/c=s4096", Kind: albumKindUserPhoto, Width: 800, Height: 600},
+	}
+
+	selected := selectAlbumPhotos(photos, 10)
+
+	require.Len(t, selected, 1)
+	require.Equal(t, "foto", selected[0].ID)
+}
+
+func TestPanoramaHelpersReadTheShapeAndTheDirective(t *testing.T) {
+	require.True(t, isPanoramaShape(7200, 3600))
+	require.True(t, isPanoramaShape(4096, 2048))
+	require.False(t, isPanoramaShape(1920, 1080))
+	require.False(t, isPanoramaShape(0, 0))
+
+	require.True(t, hasPanoramaDirective("https://lh3.googleusercontent.com/p/x=w224-h298-k-no-pi0-ya80-ro1-fo100"))
+	// A plain directive must not look like an angle: -rw is WebP and -no is "no overlay".
+	require.False(t, hasPanoramaDirective("https://lh3.googleusercontent.com/p/x=s4096-rw-l60"))
+	require.False(t, hasPanoramaDirective("https://lh3.googleusercontent.com/p/x=w224-h298-k-no"))
+	require.False(t, hasPanoramaDirective("https://lh3.googleusercontent.com/p/x"))
 }
 
 func TestSelectAlbumPhotosKeepsTheBiggestFirst(t *testing.T) {
@@ -123,7 +165,7 @@ func TestSelectAlbumPhotosKeepsTheBiggestFirst(t *testing.T) {
 // queued photograph that can never download is worse than no photograph at all.
 func TestSelectAlbumPhotosDropsStreetViewTiles(t *testing.T) {
 	photos := []AlbumPhoto{
-		{ID: "pano", URL: "https://streetviewpixels-pa.googleapis.com/v1/thumbnail?panoid=X&w=203", Kind: 12, Width: 203, Height: 100},
+		{ID: "tile", URL: "https://streetviewpixels-pa.googleapis.com/v1/thumbnail?panoid=X&w=203", Kind: 12, Width: 203, Height: 100},
 		{ID: "real", URL: "https://lh3.googleusercontent.com/gps-cs-s/real", Kind: 12, Width: 800, Height: 600},
 	}
 

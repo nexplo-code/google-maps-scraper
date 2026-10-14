@@ -31,13 +31,37 @@ same route `fetchWithBrowser` already takes for reviews.
 */
 
 const (
-	// How many photographs to keep per place. Ten is the storage budget; the surplus covers the
-	// kinds that get filtered (panoramas, Street View tiles) and URLs that die before download.
-	albumDefaultLimit = 24
-	albumMaxLimit     = 60
+	// The ceiling on any value asked for. The limit is a cap on what is *carried out* of a listing
+	// already fetched, never on what is fetched, so it costs no page time whatever it is set to.
+	//
+	// Ten is the right value in production and there is no point carrying more: the storage budget
+	// on the other side is ten per place, the Node selection cuts at ten, and a download that
+	// fails is never refilled from the leftovers — so a surplus is bytes in a CSV that nothing
+	// reads. It used to be justified as covering "the kinds that get filtered", which stopped
+	// being true when the filtering moved ahead of the cut.
+	albumMaxLimit = 60
 
-	// Photo kinds, as the entity array reports them at index 2.
+	/*
+		Photo kinds, as the entity array reports them at index 2. Measured, not guessed — against
+		one tourist place whose album holds 1466 entries, of the 150 the listing returns:
+
+		  12  103  a photograph, aspect ratios all over the place
+		  10   37  a VIDEO. The entry carries the literal string "Video", and every aspect ratio is
+		           0.56 or 1.78 — portrait and landscape video. What index [6][0] hands back is the
+		           still frame, on the same lh3 host as a photograph.
+		  11   10  a PANORAMA. Every single one is exactly 2:1 equirectangular, e.g. 7200x3600.
+
+		This file previously read 10 as "some other kind of photograph" and topped up with it when
+		a place was short of photographs — which quietly made videos and panoramas storable.
+	*/
 	albumKindUserPhoto = 12
+	albumKindVideo     = 10
+	albumKindPanorama  = 11
+
+	// A panorama is 2:1, give or take the odd stitched pixel. Belt and braces behind the kind:
+	// a kind we have not met yet cannot sneak an equirectangular strip past us on aspect alone.
+	albumPanoramaAspectMin = 1.97
+	albumPanoramaAspectMax = 2.03
 
 	// Long enough for the page to settle, short enough that a batch of sixteen places does not
 	// notice it.
@@ -276,33 +300,41 @@ func parseAlbumResponse(data []byte) (photos []AlbumPhoto, total int, err error)
 }
 
 /*
-selectAlbumPhotos keeps the photographs worth storing, best first.
+selectAlbumPhotos keeps the photographs worth storing, biggest first.
 
-Three rules, in order of how much they matter:
+An allowlist, not a filter: only kind 12 survives, and anything else is dropped however short of
+the limit the place leaves us. This used to be a preference with a top-up — "a place whose whole
+album is five panoramas must still come back with five" — and that reasoning was wrong twice over.
+It assumed the other kinds were photographs (10 is a video), and it treated a thin album as a
+problem worth solving with worse material. A panorama is not a photograph of the place and a still
+frame lifted out of a video is not one either; a place with four good photographs is better served
+by four than by four plus six frames of someone's walkthrough.
 
-Street View tiles go first. They are served from a host that answers 403 to anything but Maps
-itself, so keeping one means a queued photo that can never download — 1239 of them in one past
-sweep, which is what the unexplained "403 problem" in the run notes actually was.
+Then the guards that do not depend on the kind, because an unmet kind must not be able to walk
+past: no Street View tile (403 to anything but Maps itself — 1239 of them in one past sweep, which
+is what the unexplained "403 problem" in the run notes actually was), no baked-in camera angle, no
+2:1 equirectangular.
 
-User photographs outrank everything else, but only as a preference: a place whose whole album is
-five panoramas must still come back with five. Filtering kind strictly is how a small place ends
-up with nothing.
+Biggest first, by pixel area, because whoever stores these rewrites the size directive to ask for
+the original and that request never upscales — so native resolution decides what the stored
+photograph will actually look like.
 
-Then biggest first, by pixel area. Whoever stores these rewrites the size directive to ask for the
-original, and that request never upscales — so native resolution is the only thing that decides
-what the stored photograph will actually look like.
+All of this is arithmetic on an answer already in hand: no extra request, no extra page time.
 */
 func selectAlbumPhotos(photos []AlbumPhoto, limit int) []AlbumPhoto {
 	if limit <= 0 {
 		return nil
 	}
 
-	preferred := make([]AlbumPhoto, 0, len(photos))
-	fallback := make([]AlbumPhoto, 0, len(photos))
+	selected := make([]AlbumPhoto, 0, len(photos))
 	seen := make(map[string]struct{}, len(photos))
 
 	for _, photo := range photos {
-		if photo.URL == "" || isStreetViewPhotoURL(photo.URL) {
+		if photo.URL == "" || photo.Kind != albumKindUserPhoto {
+			continue
+		}
+
+		if !isStorablePhotoURL(photo.URL) || isPanoramaShape(photo.Width, photo.Height) {
 			continue
 		}
 
@@ -317,27 +349,58 @@ func selectAlbumPhotos(photos []AlbumPhoto, limit int) []AlbumPhoto {
 
 		seen[key] = struct{}{}
 
-		if photo.Kind == albumKindUserPhoto {
-			preferred = append(preferred, photo)
-			continue
-		}
-
-		fallback = append(fallback, photo)
+		selected = append(selected, photo)
 	}
 
-	sortAlbumPhotosByArea(preferred)
-	sortAlbumPhotosByArea(fallback)
-
-	selected := preferred
-	if len(selected) < limit {
-		selected = append(selected, fallback...)
-	}
+	sortAlbumPhotosByArea(selected)
 
 	if len(selected) > limit {
 		selected = selected[:limit]
 	}
 
 	return selected
+}
+
+// isStorablePhotoURL rejects the two things a URL can tell us are not a plain photograph.
+func isStorablePhotoURL(u string) bool {
+	return !isStreetViewPhotoURL(u) && !hasPanoramaDirective(u)
+}
+
+/*
+hasPanoramaDirective reports whether the size directive carries a camera angle.
+
+A photosphere is served from the same lh3 host as a photograph and is given a viewing angle in its
+directive — `=w224-h298-k-no-pi0.03-ya80.00-ro1.02-fo100`: pitch, yaw, roll, field of view. Those
+only mean something for imagery you can turn around in.
+
+This matters twice. The entry is not a photograph of the place, and the crop is not even stable:
+asking for a different size replaces the whole directive, so `=s4096-rw-l60` throws the angle away
+and returns the entire equirectangular strip. 161 of these are already stored in our catalogue,
+26 of them as a place's cover.
+*/
+func hasPanoramaDirective(u string) bool {
+	directive := u
+	if idx := strings.LastIndex(u, "="); idx > strings.LastIndex(u, "/") {
+		directive = u[idx:]
+	} else {
+		return false
+	}
+
+	lowered := strings.ToLower(directive)
+
+	return strings.Contains(lowered, "-ya") || strings.Contains(lowered, "-pi") ||
+		strings.Contains(lowered, "-ro") || strings.Contains(lowered, "-fo")
+}
+
+// isPanoramaShape reports whether these dimensions are equirectangular.
+func isPanoramaShape(width, height int) bool {
+	if width <= 0 || height <= 0 {
+		return false
+	}
+
+	aspect := float64(width) / float64(height)
+
+	return aspect >= albumPanoramaAspectMin && aspect <= albumPanoramaAspectMax
 }
 
 // sortAlbumPhotosByArea orders by pixel area, descending, keeping the album's own order on ties.

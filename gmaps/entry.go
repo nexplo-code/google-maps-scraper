@@ -20,6 +20,13 @@ var panoidRegex = regexp.MustCompile(`panoid=([^&]+)`)
 type Image struct {
 	Title string `json:"title"`
 	Image string `json:"image"`
+	// What the gallery says this entry is: 12 a photograph, 10 a video, 11 a panorama.
+	//
+	// Carried out of the page because the URL does not say. A video's entry hands back a still
+	// frame on the same lh3 host as a photograph, so whoever stores these cannot tell the two
+	// apart downstream — measured on one tourist place: 103 photographs, 37 videos, 10 panoramas.
+	// Zero for a legacy entry that never had it, which is why absent means "unknown", not "photo".
+	Kind int `json:"kind,omitempty"`
 }
 
 type LinkSource struct {
@@ -842,7 +849,11 @@ func imagesFromGallery(items []any) []Image {
 			continue
 		}
 
-		images = append(images, Image{Image: link})
+		//nolint:gomnd // the kind lives at index 2
+		images = append(images, Image{
+			Image: link,
+			Kind:  int(getNthElementAndCast[float64](item, 2)),
+		})
 	}
 
 	return images
