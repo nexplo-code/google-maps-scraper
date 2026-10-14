@@ -850,10 +850,24 @@ func imagesFromGallery(items []any) []Image {
 		}
 
 		//nolint:gomnd // the kind lives at index 2
-		images = append(images, Image{
-			Image: link,
-			Kind:  int(getNthElementAndCast[float64](item, 2)),
-		})
+		kind := int(getNthElementAndCast[float64](item, 2))
+
+		/*
+		   The page's own strip carries videos too — measured, one in four of the four entries it
+		   renders for a busy place. A video's entry hands back a still frame from the same host as
+		   a photograph, so it has to be dropped here, where the kind still exists; by the time this
+		   is a CSV column the kind is all that is left of the distinction.
+
+		   Interior view goes with it: it answers 400 however it is asked for.
+
+		   What is deliberately *kept* is the Street View tile. It is the only place the panorama
+		   link at `street_view` is read from, and whoever stores these rejects it by host anyway.
+		*/
+		if kind == albumKindVideo || kind == albumKindPanorama || isInteriorViewURL(link) {
+			continue
+		}
+
+		images = append(images, Image{Image: link, Kind: kind})
 	}
 
 	return images

@@ -48,8 +48,10 @@ func TestEntryCsvHeadersAndRowStayAligned(t *testing.T) {
 func TestGetImagesReadsTheCurrentGallery(t *testing.T) {
 	darray := newDarray()
 	darray[51] = []any{[]any{
-		galleryItem("https://lh3.googleusercontent.com/grass-cs/one", 12),
-		galleryItem("https://lh3.googleusercontent.com/grass-cs/two", 10),
+		galleryItem("https://lh3.googleusercontent.com/grass-cs/one", albumKindUserPhoto),
+		// Was kind 10 here, written when 10 was believed to be "some other photograph". It is a
+		// video, and the gallery reader now drops it — see the test below.
+		galleryItem("https://lh3.googleusercontent.com/grass-cs/two", albumKindUserPhoto),
 	}}
 
 	images := getImages(darray)
@@ -144,4 +146,55 @@ func TestExtractStreetViewURLIsEmptyWithoutAPanorama(t *testing.T) {
 	require.Empty(t, extractStreetViewURL([]Image{
 		{Image: "https://lh3.googleusercontent.com/grass-cs/photo"},
 	}))
+}
+
+// The page's own strip carries videos: measured, one of the four entries it renders for a busy
+// place. The kind is the only thing that says so — the URL hands back a still frame from the same
+// host a photograph comes from.
+func TestGetImagesDropsVideosAndPanoramasFromTheGallery(t *testing.T) {
+	darray := newDarray()
+	darray[51] = []any{[]any{
+		galleryItem("https://lh3.googleusercontent.com/grass-cs/foto", albumKindUserPhoto),
+		galleryItem("https://lh3.googleusercontent.com/grass-cs/video", albumKindVideo),
+		galleryItem("https://lh3.googleusercontent.com/grass-cs/pano", albumKindPanorama),
+	}}
+
+	images := getImages(darray)
+
+	require.Len(t, images, 1)
+	require.Equal(t, "https://lh3.googleusercontent.com/grass-cs/foto", images[0].Image)
+	require.Equal(t, albumKindUserPhoto, images[0].Kind)
+}
+
+// Interior view answers 400 however it is asked for, with or without a size directive, so it is a
+// queued download that can never succeed.
+func TestGetImagesDropsInteriorView(t *testing.T) {
+	darray := newDarray()
+	darray[51] = []any{[]any{
+		galleryItem("https://lh3.googleusercontent.com/iv/AL8Kk5oX06t6", 0),
+		galleryItem("https://lh3.googleusercontent.com/grass-cs/foto", albumKindUserPhoto),
+	}}
+
+	images := getImages(darray)
+
+	require.Len(t, images, 1)
+	require.Equal(t, "https://lh3.googleusercontent.com/grass-cs/foto", images[0].Image)
+}
+
+// Kept on purpose: the tile is the only source of the panorama link in `street_view`, and whoever
+// stores these rejects it by host.
+func TestGetImagesKeepsTheStreetViewTileForTheLink(t *testing.T) {
+	darray := newDarray()
+	darray[51] = []any{[]any{
+		galleryItem("https://streetviewpixels-pa.googleapis.com/v1/thumbnail?panoid=ABC&w=203", 1),
+		galleryItem("https://lh3.googleusercontent.com/grass-cs/foto", albumKindUserPhoto),
+	}}
+
+	images := getImages(darray)
+
+	require.Len(t, images, 2)
+	require.Equal(t,
+		"https://www.google.com/maps/@?api=1&map_action=pano&pano=ABC",
+		extractStreetViewURL(images),
+	)
 }

@@ -363,7 +363,7 @@ func selectAlbumPhotos(photos []AlbumPhoto, limit int) []AlbumPhoto {
 
 // isStorablePhotoURL rejects the two things a URL can tell us are not a plain photograph.
 func isStorablePhotoURL(u string) bool {
-	return !isStreetViewPhotoURL(u) && !hasPanoramaDirective(u)
+	return !isStreetViewPhotoURL(u) && !isInteriorViewURL(u) && !hasPanoramaDirective(u)
 }
 
 /*
@@ -408,6 +408,18 @@ func sortAlbumPhotosByArea(photos []AlbumPhoto) {
 	sort.SliceStable(photos, func(i, j int) bool {
 		return photos[i].Width*photos[i].Height > photos[j].Width*photos[j].Height
 	})
+}
+
+/*
+isInteriorViewURL reports whether this is Street View imagery from inside the place.
+
+Served from the same lh3 host as a photograph but under `/iv/` — interior view — and it is not
+fetchable at all: measured, it answers HTTP 400 with an HTML error both as it comes and with any
+size directive appended. So it is useless twice over, as imagery we do not want and as a URL that
+can never download. It arrives with no kind at all, which is why the path has to be read.
+*/
+func isInteriorViewURL(u string) bool {
+	return strings.Contains(strings.ToLower(u), "googleusercontent.com/iv/")
 }
 
 // isStreetViewPhotoURL reports whether this is a panorama tile rather than a photograph.
