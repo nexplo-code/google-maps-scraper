@@ -39,11 +39,21 @@ func NewGmapJob(
 	zoom int,
 	opts ...GmapJobOptions,
 ) *GmapJob {
-	var mapURL string
+	var (
+		mapURL    string
+		urlParams = map[string]string{"hl": langCode}
+	)
 
 	switch {
 	case isGoogleMapsURL(query):
-		mapURL = strings.TrimSpace(query)
+		// The language goes inside the URL here, not in URLParams.
+		//
+		// scrapemate's GetFullURL always joins params with a literal "?", so a query string
+		// that is already part of the URL — as in /maps/place/?q=place_id:<id> — comes out as
+		// "...?q=place_id:<id>?hl=pt". Google answers that with a page that never loads the
+		// place, and the job dies on "timeout while getting raw data" a minute later.
+		mapURL = withLangCode(strings.TrimSpace(query), langCode)
+		urlParams = nil
 	case geoCoordinates != "" && zoom > 0:
 		query = url.QueryEscape(query)
 		mapURL = fmt.Sprintf("https://www.google.com/maps/search/%s/@%s,%dz", query, strings.ReplaceAll(geoCoordinates, " ", ""), zoom)
@@ -67,7 +77,7 @@ func NewGmapJob(
 			ID:         id,
 			Method:     http.MethodGet,
 			URL:        mapURL,
-			URLParams:  map[string]string{"hl": langCode},
+			URLParams:  urlParams,
 			MaxRetries: maxRetries,
 			Priority:   prio,
 		},
@@ -211,17 +221,24 @@ func (j *GmapJob) BrowserActions(ctx context.Context, page scrapemate.BrowserPag
 	// check element scroll
 	sel := `div[role='feed']`
 
-	err = page.WaitForSelector(sel, 10*time.Second)
+	// A query that addresses one place directly — a /maps/place/ URL, or
+	// /maps/place/?q=place_id:<id> — never renders a results feed. Asking for the URL first
+	// costs nothing and is what keeps us out of the scroll below: without it the ten second
+	// wait for the feed is spent in vain and `scroll` then evaluates `el.scrollHeight` on a
+	// null element, which surfaces as a playwright TypeError and fails the whole job.
+	singlePlace := strings.Contains(page.URL(), "/maps/place/")
 
-	var singlePlace bool
+	if !singlePlace {
+		err = page.WaitForSelector(sel, 10*time.Second)
 
-	if err != nil {
-		waitCtx, waitCancel := context.WithTimeout(ctx, time.Second*5)
-		defer waitCancel()
+		if err != nil {
+			waitCtx, waitCancel := context.WithTimeout(ctx, time.Second*5)
+			defer waitCancel()
 
-		singlePlace = waitUntilURLContains(waitCtx, page, "/maps/place/")
+			singlePlace = waitUntilURLContains(waitCtx, page, "/maps/place/")
 
-		waitCancel()
+			waitCancel()
+		}
 	}
 
 	if singlePlace {
@@ -374,6 +391,26 @@ func scroll(ctx context.Context,
 	}
 
 	return cnt, nil
+}
+
+// withLangCode returns rawURL with hl set to langCode, keeping whatever query it already has.
+// An unparseable URL is returned untouched: the caller is better served by the original address
+// than by a silently mangled one.
+func withLangCode(rawURL, langCode string) string {
+	if langCode == "" {
+		return rawURL
+	}
+
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+
+	q := u.Query()
+	q.Set("hl", langCode)
+	u.RawQuery = q.Encode()
+
+	return u.String()
 }
 
 func isGoogleMapsURL(s string) bool {
