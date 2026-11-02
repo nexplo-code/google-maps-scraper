@@ -2,6 +2,8 @@ package gmaps
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/url"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -17,12 +19,20 @@ func albumItem(id, url string, kind, width, height float64) []any {
 	return item
 }
 
-// albumBody wraps items the way the endpoint does: the anti-hijacking prefix, the photographs at
-// index 0 and the place's true total at index 1.
+// albumBody wraps items the way the endpoint does, on a last page: no next token.
 func albumBody(t *testing.T, items []any, total float64) []byte {
+	return albumBodyWithToken(t, items, total, "")
+}
+
+// albumBodyWithToken wraps items the way the endpoint does: the anti-hijacking prefix, the
+// photographs at index 0, the place's true total at index 1 and the next page's token at index 5.
+func albumBodyWithToken(t *testing.T, items []any, total float64, next string) []byte {
 	t.Helper()
 
-	payload := []any{items, total, nil, "token", nil}
+	payload := []any{items, total, nil, "request-id", nil, nil}
+	if next != "" {
+		payload[albumNextTokenIndex] = next
+	}
 
 	encoded, err := json.Marshal(payload)
 	require.NoError(t, err)
@@ -36,7 +46,7 @@ func TestParseAlbumResponseReadsPhotographsAndTotal(t *testing.T) {
 		albumItem("CIHM0two", "https://lh3.googleusercontent.com/gps-cs-s/two=w203-h360-k-no", 10, 3024, 4032),
 	}, 344)
 
-	photos, total, err := parseAlbumResponse(body)
+	photos, total, _, err := parseAlbumResponse(body)
 
 	require.NoError(t, err)
 	require.Equal(t, 344, total)
@@ -55,7 +65,7 @@ func TestParseAlbumResponseReadsPhotographsAndTotal(t *testing.T) {
 func TestParseAlbumResponseTolerantOfATotalWithoutPhotographs(t *testing.T) {
 	body := albumBody(t, nil, 344)
 
-	photos, total, err := parseAlbumResponse(body)
+	photos, total, _, err := parseAlbumResponse(body)
 
 	require.NoError(t, err)
 	require.Equal(t, 344, total)
@@ -68,7 +78,7 @@ func TestParseAlbumResponseSkipsAnItemWithoutAURL(t *testing.T) {
 		albumItem("CIHM0real", "https://lh3.googleusercontent.com/gps-cs-s/real=w203", 12, 800, 600),
 	}, 2)
 
-	photos, _, err := parseAlbumResponse(body)
+	photos, _, _, err := parseAlbumResponse(body)
 
 	require.NoError(t, err)
 	require.Len(t, photos, 1)
@@ -76,7 +86,7 @@ func TestParseAlbumResponseSkipsAnItemWithoutAURL(t *testing.T) {
 }
 
 func TestParseAlbumResponseRefusesSomethingThatIsNotJson(t *testing.T) {
-	_, _, err := parseAlbumResponse([]byte(")]}'\n<html>sign in</html>"))
+	_, _, _, err := parseAlbumResponse([]byte(")]}'\n<html>sign in</html>"))
 
 	require.Error(t, err)
 }
@@ -211,7 +221,7 @@ func TestSelectAlbumPhotosRespectsTheLimit(t *testing.T) {
 }
 
 func TestAlbumURLCarriesTheFeatureIdAndLanguage(t *testing.T) {
-	u := albumURL("0x935a3002feee27b1:0x7bf9e264080130b4", "pt", "br")
+	u := albumURL("0x935a3002feee27b1:0x7bf9e264080130b4", "pt", "br", "")
 
 	require.Contains(t, u, "/maps/rpc/photo/listentityphotos")
 	require.Contains(t, u, "hl=pt")
@@ -220,7 +230,7 @@ func TestAlbumURLCarriesTheFeatureIdAndLanguage(t *testing.T) {
 }
 
 func TestAlbumURLFallsBackToAnEnglishLocale(t *testing.T) {
-	u := albumURL("0xabc:0xdef", "", "")
+	u := albumURL("0xabc:0xdef", "", "", "")
 
 	require.Contains(t, u, "hl=en")
 	require.Contains(t, u, "gl=us")
@@ -262,4 +272,120 @@ func TestFetchAlbumIsANoOpWhenDisabledOrUnidentified(t *testing.T) {
 	photos, err = FetchAlbum(t.Context(), nil, "", "pt", "br", 10)
 	require.NoError(t, err)
 	require.Empty(t, photos)
+}
+
+func TestDescribeAlbumKindsCountsWhatTheListingReported(t *testing.T) {
+	photos := []AlbumPhoto{
+		{Kind: albumKindUserPhoto}, {Kind: albumKindUserPhoto},
+		{Kind: albumKindVideo}, {Kind: albumKindPanorama}, {Kind: albumKindPanorama},
+	}
+
+	require.Equal(t, "10:1,11:2,12:2", describeAlbumKinds(photos))
+	require.Equal(t, "none", describeAlbumKinds(nil))
+}
+
+/*
+Holds describeAlbumDrops to selectAlbumPhotos.
+
+The diagnostic mirrors the selection rather than sharing a counter with it, so the one thing worth
+asserting is that the two still agree: everything the selection refused is accounted for by exactly
+one guard, and the arithmetic closes. A drift here is how a diagnostic starts lying about which
+guard spent the photographs — which is the question it exists to answer.
+*/
+func TestDescribeAlbumDropsAccountsForEverySelectionRefusal(t *testing.T) {
+	photos := []AlbumPhoto{
+		{ID: "a", URL: "https://lh3.googleusercontent.com/p/a=s1600", Kind: albumKindUserPhoto, Width: 1600, Height: 1200},
+		{ID: "b", URL: "", Kind: albumKindUserPhoto},
+		{ID: "c", URL: "https://lh3.googleusercontent.com/p/c=s1600", Kind: albumKindVideo},
+		{ID: "d", URL: "https://lh3.googleusercontent.com/iv/d=s1600", Kind: albumKindUserPhoto},
+		{ID: "e", URL: "https://lh3.googleusercontent.com/p/e=s1600", Kind: albumKindUserPhoto, Width: 7200, Height: 3600},
+		{ID: "a", URL: "https://lh3.googleusercontent.com/p/a=s4096", Kind: albumKindUserPhoto, Width: 1600, Height: 1200},
+	}
+
+	require.Equal(
+		t,
+		"no_url=1 wrong_kind=1 not_storable=1 panorama=1 duplicate=1",
+		describeAlbumDrops(photos),
+	)
+
+	// The arithmetic closes: one survivor plus five accounted refusals is the whole listing.
+	kept := selectAlbumPhotos(photos, len(photos))
+	require.Len(t, kept, 1)
+	require.Equal(t, "a", kept[0].ID)
+}
+
+/*
+The regression this file exists for after 2026-11-02.
+
+The listing serves ten photographs a page and names the next page in the envelope. Sending `!5s`
+empty asks for page one, which is what a sweep that had been gathering thirty candidates per place
+silently went back to doing — the count fell to eight and nothing here had changed. So the token
+must reach the request, and the empty token must not put one in.
+*/
+func TestAlbumURLCarriesThePageToken(t *testing.T) {
+	withToken := albumURL("0xabc:0xdef", "pt", "br", "SvwIQ3Rv/R0NB+MS")
+
+	// The pb segments go in raw — only the token's own reserved characters are escaped, which
+	// matters because these tokens carry `/` and `+`.
+	require.Contains(t, withToken, "!5s"+url.QueryEscape("SvwIQ3Rv/R0NB+MS"))
+	require.NotContains(t, withToken, "SvwIQ3Rv/R0NB+MS")
+
+	firstPage := albumURL("0xabc:0xdef", "pt", "br", "")
+
+	require.Contains(t, firstPage, "!5s!6m1")
+}
+
+func TestParseAlbumResponseReadsTheNextPageToken(t *testing.T) {
+	body := albumBodyWithToken(t, []any{
+		albumItem("CIHM0one", "https://lh3.googleusercontent.com/gps-cs-s/one=w203", 12, 800, 600),
+	}, 3699, "pagina-dois")
+
+	_, total, next, err := parseAlbumResponse(body)
+
+	require.NoError(t, err)
+	require.Equal(t, 3699, total)
+	require.Equal(t, "pagina-dois", next)
+
+	// A last page names no successor, and that is what ends the walk.
+	_, _, next, err = parseAlbumResponse(albumBody(t, nil, 3699))
+
+	require.NoError(t, err)
+	require.Empty(t, next)
+}
+
+/*
+The envelope the Wiz endpoint answers with, and the mistake it cost.
+
+Chunks are separated by their own byte lengths written as bare numbers, so a stream decoder reads
+`12657`, then an array, then `5`, then another. Decoding straight into a slice makes that first
+number a type error and discards a response that was perfectly good — measured against four live
+places, every one of which reported "no payload" while holding photographs.
+*/
+func TestUnwrapWizEnvelopeSkipsTheLengthPrefixes(t *testing.T) {
+	payload := `[[["CIHM0one",10,12,null,null,null,["https://lh3.googleusercontent.com/p/one=w203"]]],200]`
+	rows, err := json.Marshal([]any{[]any{"wrb.fr", albumWizRPCID, payload, nil, nil, nil, "generic"}})
+	require.NoError(t, err)
+
+	body := fmt.Sprintf(")]}'\n\n%d\n%s\n5\n[[\"di\",7]]\n", len(rows), rows)
+
+	inner, err := unwrapWizEnvelope([]byte(body))
+
+	require.NoError(t, err)
+	require.JSONEq(t, payload, string(inner))
+
+	// And the payload is the shape the existing parser already reads.
+	photos, total, _, err := parseAlbumResponse(inner)
+	require.NoError(t, err)
+	require.Equal(t, 200, total)
+	require.Len(t, photos, 1)
+	require.Equal(t, "CIHM0one", photos[0].ID)
+}
+
+func TestUnwrapWizEnvelopeRefusesAnEnvelopeWithoutThePayload(t *testing.T) {
+	rows, err := json.Marshal([]any{[]any{"wrb.fr", "outroRpc", "[]", nil}})
+	require.NoError(t, err)
+
+	_, err = unwrapWizEnvelope([]byte(fmt.Sprintf(")]}'\n\n%d\n%s\n", len(rows), rows)))
+
+	require.Error(t, err)
 }
